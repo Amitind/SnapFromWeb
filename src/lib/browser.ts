@@ -1,18 +1,9 @@
-import type { Browser, LaunchOptions, Page, ScreenshotOptions } from 'puppeteer';
+import { chromium, type Browser, type LaunchOptions, type Page, type PageScreenshotOptions } from 'patchright';
 
-import AdblockerPlugin from 'puppeteer-extra-plugin-adblocker';
-import AnonymizeUAPlugin from 'puppeteer-extra-plugin-anonymize-ua';
-import Stealth from 'puppeteer-extra-plugin-stealth';
-import { addExtra } from 'puppeteer-extra';
-import puppeteer from "puppeteer";
-
-const puppeteerExtra = addExtra(puppeteer);
-puppeteerExtra.use(Stealth());
-puppeteerExtra.use(AdblockerPlugin({ blockTrackers: true }));
-puppeteerExtra.use(AnonymizeUAPlugin());
-
+// Stealth is built into Patchright. Keep launch options minimal (no custom headers),
+// as the Patchright README recommends.
 export async function getBrowser(options: LaunchOptions = {}) {
-  const browser = await puppeteerExtra.launch({
+  const browser = await chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
@@ -26,17 +17,20 @@ export async function getBrowser(options: LaunchOptions = {}) {
   return browser;
 }
 
+// Headless Chromium reports "HeadlessChrome" in its user agent. Replace it with a normal
+// Chrome user agent (what puppeteer-extra-plugin-anonymize-ua did).
+export function getUserAgent(browser: Browser) {
+  return `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${browser.version()} Safari/537.36`;
+}
+
 export async function getPage(browser: Browser, url: string) {
-  const page = await browser.newPage();
-  await page.setViewport({ width: 1920, height: 1080 });
-  await page.goto(url, {
-    waitUntil: ['domcontentloaded', 'networkidle0'],
-    timeout: 25000
-  });
+  const context = await browser.newContext({ viewport: { width: 1920, height: 1080 } });
+  const page = await context.newPage();
+  await page.goto(url, { waitUntil: 'networkidle', timeout: 25000 });
   return page;
 }
 
-export async function takeScreenshot(page: Page, options: ScreenshotOptions = { type: 'png', encoding: 'binary' }) {
+export async function takeScreenshot(page: Page, options: PageScreenshotOptions = { type: 'png' }) {
   const screenshot = await page.screenshot(options);
   return screenshot;
 }

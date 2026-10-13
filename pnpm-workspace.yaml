@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: true
+  sharp: true
+
+overrides:
+  # favilib (via astro-favicons) pins sharp ^0.33, which Dependabot flags
+  favilib>sharp: ^0.35.5

@@ -1,6 +1,6 @@
 # SnapFromWeb
 
-A web service that captures screenshots of web pages using Puppeteer with stealth mode and ad-blocking capabilities.
+A web service that captures screenshots of web pages using Patchright (Playwright with built-in stealth patches).
 
 ![Screenshot](./public/og.png)
 
@@ -8,9 +8,8 @@ A web service that captures screenshots of web pages using Puppeteer with stealt
 
 - Single and bulk URL screenshot capture
 - Stealth mode to avoid detection
-- Ad-blocking for clean screenshots
 - Caching of previously captured screenshots
-- Concurrent processing using Puppeteer Cluster
+- Concurrent processing with one shared browser and an isolated context per page (`MAX_CONCURRENCY`)
 - High-quality full-page screenshots
 - Caching of previously captured screenshots
 - Screenshot Organization by Domain
@@ -66,6 +65,7 @@ For multiple URLs:
 1. Install dependencies:
 ```bash
 pnpm install
+pnpm exec patchright install chromium
 ```
 
 2. Start the development server:

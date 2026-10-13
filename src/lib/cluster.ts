@@ -1,8 +1,7 @@
 import { getCachedScreenshotPath, getScreenshotPath, saveScreenshot } from '@/lib/storage';
 
-import { Cluster } from 'puppeteer-cluster';
-import type { Page } from 'puppeteer';
-import { takeScreenshot } from '@/lib/browser';
+import type { Browser, LaunchOptions } from 'patchright';
+import { getBrowser, getUserAgent, takeScreenshot } from '@/lib/browser';
 import 'dotenv/config'
 
 const {HEADLESS_BROWSER, MAX_CONCURRENCY, PAGE_LOAD_TIMEOUT, RETRY_LIMIT} = process.env;
@@ -14,18 +13,15 @@ export interface ScreenshotResult {
   cached?: boolean;
 }
 
+// One shared browser, a new isolated context per task (same model as
+// puppeteer-cluster's CONCURRENCY_CONTEXT).
 const defaultClusterOptions = {
-  // CONCURRENCY_CONTEXT: Single browser, multiple incognito contexts (isolated, shared browser)
-  // CONCURRENCY_BROWSER: Multiple browsers (one per worker - uses more resources)
-  // CONCURRENCY_PAGE: Single browser, reuses pages (not recommended - shares state)
-  concurrency: Cluster.CONCURRENCY_CONTEXT,
   maxConcurrency: Number(MAX_CONCURRENCY) || 10,
   timeout: Number(PAGE_LOAD_TIMEOUT) || 30000,
   retryLimit: Number(RETRY_LIMIT) || 2,
-  monitor: true,
 };
 
-const defaultPuppeteerOptions = {
+const defaultPuppeteerOptions: LaunchOptions = {
   headless: HEADLESS_BROWSER === 'true' || HEADLESS_BROWSER === '1',
   args: [
     '--no-sandbox',
@@ -37,21 +33,94 @@ const defaultPuppeteerOptions = {
 };
 
 export type ClusterOptions = Partial<typeof defaultClusterOptions>;
-export type PuppeteerOptions = Partial<typeof defaultPuppeteerOptions>;
+export type PuppeteerOptions = Partial<LaunchOptions>;
 
-interface LaunchClusterOptions {
-  cluster?: ClusterOptions;
-  puppeteer?: PuppeteerOptions;
+// Shared browser, relaunched on the next task if it disconnects or crashes
+let browserPromise: Promise<Browser> | null = null;
+
+function getSharedBrowser(): Promise<Browser> {
+  if (!browserPromise) {
+    const launching = getBrowser(defaultPuppeteerOptions).then((browser) => {
+      browser.on('disconnected', () => {
+        if (browserPromise === launching) browserPromise = null;
+      });
+      return browser;
+    });
+    launching.catch(() => {
+      if (browserPromise === launching) browserPromise = null;
+    });
+    browserPromise = launching;
+  }
+  return browserPromise;
 }
 
-// Singleton cluster instance
-let clusterInstance: Cluster<string, ScreenshotResult> | null = null;
-let clusterInitPromise: Promise<Cluster<string, ScreenshotResult>> | null = null;
+// Patchright's own SIGTERM handler closes the browser but keeps Node alive,
+// so close the browser and exit here
+process.once('SIGTERM', () => {
+  closeCluster().finally(() => process.exit(0));
+});
+
+// Promise-based concurrency limiter capped at maxConcurrency
+let active = 0;
+const waiting: (() => void)[] = [];
+
+async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (active >= defaultClusterOptions.maxConcurrency) {
+    await new Promise<void>((resolve) => waiting.push(resolve));
+  } else {
+    active++;
+  }
+  try {
+    return await fn();
+  } finally {
+    const next = waiting.shift();
+    if (next) next(); // hand the slot to the next task
+    else active--;
+  }
+}
+
+class HttpError extends Error {}
+
+/**
+ * Load the page in a fresh context and save the screenshot to outputPath.
+ */
+async function capture(url: string, outputPath: string): Promise<void> {
+  const browser = await getSharedBrowser();
+  const context = await browser.newContext({
+    viewport: { width: 1920, height: 1080 },
+    userAgent: defaultPuppeteerOptions.headless ? getUserAgent(browser) : undefined,
+  });
+  try {
+    const page = await context.newPage();
+    const response = await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: defaultClusterOptions.timeout,
+    });
+
+    // Check for HTTP errors - don't screenshot error pages
+    const status = response?.status() ?? 0;
+    if (status >= 400) {
+      throw new HttpError(`HTTP ${status}: Server returned error status`);
+    }
+
+    // Playwright has no networkidle2; wait for load and network idle, but don't
+    // fail on sites that never settle (analytics, polling, slow ads)
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+
+    // Extra wait for any lazy-loaded content or animations to settle
+    await page.waitForTimeout(500);
+
+    const screenshot = await takeScreenshot(page);
+    await saveScreenshot(screenshot, outputPath);
+  } finally {
+    await context.close().catch(() => {});
+  }
+}
 
 /**
  * Screenshot task function - processes a single URL
  */
-async function screenshotTask({ page, data: url }: { page: Page; data: string }): Promise<ScreenshotResult> {
+async function screenshotTask(url: string): Promise<ScreenshotResult> {
   try {
     // Check if screenshot already exists for this hour
     const cachedPath = await getCachedScreenshotPath(url);
@@ -68,30 +137,16 @@ async function screenshotTask({ page, data: url }: { page: Page; data: string })
     // Get the new path (includes current date-hour)
     const outputPath = await getScreenshotPath(url);
 
-    // Configure page
-    await page.setViewport({ width: 1920, height: 1080 });
-    const response = await page.goto(url, {
-      // networkidle2: allows up to 2 active connections (better for sites with analytics/websockets)
-      // networkidle0: waits for 0 connections (can hang on active sites)
-      waitUntil: ['domcontentloaded', 'networkidle2'],
-      timeout: Number(PAGE_LOAD_TIMEOUT) || 30000,
-    });
-
-    // Extra wait for any lazy-loaded content or animations to settle
-    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 500)));
-
-    // Check for HTTP errors - don't screenshot error pages
-    const status = response?.status() ?? 0;
-    if (status >= 400) {
-      throw new Error(`HTTP ${status}: Server returned error status`);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await withSlot(() => capture(url, outputPath));
+        break;
+      } catch (error) {
+        // HTTP error pages won't change on retry
+        if (error instanceof HttpError || attempt >= defaultClusterOptions.retryLimit) throw error;
+        console.error(`Retrying ${url} (${attempt + 1}/${defaultClusterOptions.retryLimit}):`, error instanceof Error ? error.message : error);
+      }
     }
-
-    // Take and save screenshot
-    const screenshot = await takeScreenshot(page);
-    if (!(screenshot instanceof Buffer)) {
-      throw new Error('Screenshot must be a Buffer');
-    }
-    await saveScreenshot(screenshot, outputPath);
 
     return {
       url,
@@ -111,81 +166,28 @@ async function screenshotTask({ page, data: url }: { page: Page; data: string })
 }
 
 /**
- * Get or create the singleton cluster instance.
- * Uses a single browser with multiple contexts for isolation.
- */
-async function getCluster({
-  cluster: clusterOptions = {},
-  puppeteer: puppeteerOptions = {},
-}: LaunchClusterOptions = {}): Promise<Cluster<string, ScreenshotResult>> {
-  // Return existing instance if available
-  if (clusterInstance) {
-    return clusterInstance;
-  }
-
-  // If initialization is in progress, wait for it
-  if (clusterInitPromise) {
-    return clusterInitPromise;
-  }
-
-  // Initialize new cluster (launched once, reused for all requests)
-  clusterInitPromise = (async () => {
-    const cluster = await Cluster.launch({
-      ...defaultClusterOptions,
-      ...clusterOptions,
-      puppeteerOptions: {
-        ...defaultPuppeteerOptions,
-        ...puppeteerOptions,
-      }
-    });
-
-    // Define the task once
-    await cluster.task(screenshotTask);
-
-    // Handle errors globally
-    cluster.on('taskerror', (err, data) => {
-      console.error(`Task error for ${data}:`, err.message);
-    });
-
-    clusterInstance = cluster;
-    return cluster;
-  })();
-
-  return clusterInitPromise;
-}
-
-/**
  * Take screenshots of one or more URLs.
- * Uses the singleton cluster - browser stays open between requests.
+ * Uses the shared browser - it stays open between requests.
  */
 export async function takeScreenshots(urls: string[]): Promise<ScreenshotResult[]> {
-  const cluster = await getCluster();
-
-  // Queue all URLs and wait for results
-  const results = await Promise.all(
-    urls.map(url => cluster.execute(url))
-  );
-
-  return results;
+  return Promise.all(urls.map(url => screenshotTask(url)));
 }
 
 /**
  * Take a screenshot of a single URL.
  */
 export async function takeScreenshotOfUrl(url: string): Promise<ScreenshotResult> {
-  const cluster = await getCluster();
-  return cluster.execute(url);
+  return screenshotTask(url);
 }
 
 /**
- * Close the singleton cluster instance.
+ * Close the shared browser.
  * Call this during graceful shutdown.
  */
 export async function closeCluster(): Promise<void> {
-  if (clusterInstance) {
-    await clusterInstance.idle();
-    await clusterInstance.close();
-    clusterInstance = null;
-    clusterInitPromise = null;
+  if (browserPromise) {
+    const browser = await browserPromise.catch(() => null);
+    browserPromise = null;
+    await browser?.close();
   }
 }
